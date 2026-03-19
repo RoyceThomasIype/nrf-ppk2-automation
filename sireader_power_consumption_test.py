@@ -10,14 +10,16 @@ Hardware:
     - PPK2 used in Source Meter mode
 
 Usage:
-    1. Connect PPK2 via USB.
-    2. By default the script auto-detects the PPK2 port.  If auto-detection
-       fails you can override it by setting SERIAL_PORT to the correct port
-       (e.g. "COM7" on Windows or "/dev/ttyACM0" on Linux/macOS).
-    3. Run:  python ppk2_amp_meter.py
-     4. Press ENTER to start each 30-second measurement cycle.
-         The script enables DUT power output at 3600 mV when the cycle starts.
-    5. Press Ctrl+C to exit.
+     1. Connect PPK2 via USB.
+     2. By default the script auto-detects the PPK2 port.  If auto-detection
+         fails you can override it by setting SERIAL_PORT to the correct port
+         (e.g. "COM7" on Windows or "/dev/ttyACM0" on Linux/macOS).
+     3. Run:  python sireader_power_consumption_test.py
+     4. Press ENTER to start a dual-phase measurement cycle:
+         - Measure 20 seconds for BLE Advertisement mode
+         - Wait 10 seconds for DUT transition to sleep (DUT power stays ON)
+         - Measure 20 seconds for Sleep mode
+     5. Press Ctrl+C to exit.
 
 Results are printed to the console and appended to 'results.csv'.
 """
@@ -35,8 +37,16 @@ from ppk2_api.ppk2_api import PPK2_API
 SERIAL_PORT = None             # None = auto-detect (recommended)
                                # Override if needed, e.g. "COM7" or "/dev/ttyACM0"
 SOURCE_VOLTAGE_MV = 3600       # DUT supply voltage in Source Meter mode.
-MEASUREMENT_DURATION_S = 30    # Duration of each measurement cycle (seconds)
+BLE_ADVERTISEMENT_DURATION_S = 20  # Duration to measure BLE advertisement mode (seconds)
+TRANSITION_WAIT_S = 10            # Wait time between measurements (seconds)
+SLEEP_MODE_DURATION_S = 20        # Duration to measure sleep mode (seconds)
 CSV_FILE = "results.csv"       # Output CSV file (created if it does not exist)
+
+# Pass/Fail criteria (in microamps)
+BLE_ADVERTISEMENT_MIN_UA = 100         # Minimum acceptable BLE advertisement current
+BLE_ADVERTISEMENT_MAX_UA = 120         # Maximum acceptable BLE advertisement current
+SLEEP_MODE_MIN_UA = 1                  # Minimum acceptable sleep mode current
+SLEEP_MODE_MAX_UA = 2                  # Maximum acceptable sleep mode current
 # ---------------------------------------------------------------------------
 
 
@@ -48,9 +58,8 @@ class PPK2AmpMeter:
     DUT at a fixed voltage and measures the DUT current during each cycle.
     """
 
-    def __init__(self, port: str | None = None, duration_s: float = 30.0, csv_file: str = CSV_FILE):
+    def __init__(self, port: str | None = None, csv_file: str = CSV_FILE):
         self.port = port  # None triggers auto-detection in connect()
-        self.duration_s = duration_s
         self.csv_file = csv_file
         self.ppk2: PPK2_API | None = None
         self.test_number = 0
@@ -144,31 +153,68 @@ class PPK2AmpMeter:
     # Measurement
     # ------------------------------------------------------------------
 
-    def start_measurement(self) -> None:
-        """Enable DUT power and begin current sampling on the PPK2."""
+    def enable_dut_power(self) -> None:
+        """Enable DUT power without starting current sampling."""
         if self.ppk2 is None:
             raise RuntimeError("PPK2 is not connected. Call connect() first.")
         self.ppk2.set_source_voltage(SOURCE_VOLTAGE_MV)
         self.ppk2.toggle_DUT_power("ON")
+
+    def disable_dut_power(self) -> None:
+        """Disable DUT power output."""
+        if self.ppk2 is not None:
+            self.ppk2.toggle_DUT_power("OFF")
+
+    def reset_sampling_state(self) -> None:
+        """Clear serial/sample parser state so the next phase starts fresh."""
+        if self.ppk2 is None:
+            raise RuntimeError("PPK2 is not connected. Call connect() first.")
+
+        try:
+            self.ppk2.ser.reset_input_buffer()
+        except Exception:
+            pass
+
+        self.ppk2.remainder = {"sequence": b"", "len": 0}
+        self.ppk2.rolling_avg = None
+        self.ppk2.rolling_avg4 = None
+        self.ppk2.prev_range = None
+        self.ppk2.consecutive_range_samples = 0
+        self.ppk2.after_spike = 0
+
+    def start_sampling(self) -> None:
+        """Begin a fresh current sampling window on the PPK2."""
+        if self.ppk2 is None:
+            raise RuntimeError("PPK2 is not connected. Call connect() first.")
+        self.reset_sampling_state()
         self.ppk2.start_measuring()
 
-    def collect_samples(self) -> list[float]:
-        """Stream samples from the PPK2 for `self.duration_s` seconds.
+    def stop_sampling(self) -> None:
+        """Stop current sampling without changing DUT power state."""
+        if self.ppk2 is not None:
+            self.ppk2.stop_measuring()
 
-        Returns a flat list of current samples in microamperes (µA) as
-        delivered by ppk2_api.get_samples().
+    def collect_samples(self, duration_s: float) -> list[float]:
+        """Stream samples from the PPK2 for the specified duration.
+
+        Args:
+            duration_s: Measurement duration in seconds.
+
+        Returns:
+            A flat list of current samples in microamperes (µA) as
+            delivered by ppk2_api.get_samples().
         """
         if self.ppk2 is None:
             raise RuntimeError("PPK2 is not connected.")
 
         raw_buffer: list[float] = []
-        deadline = time.monotonic() + self.duration_s
+        deadline = time.monotonic() + duration_s
         last_progress = -1  # track last printed progress second
 
-        print(f"Sampling for {self.duration_s:.0f} seconds …", end="", flush=True)
+        print(f"Sampling for {duration_s:.0f} seconds …", end="", flush=True)
 
         while time.monotonic() < deadline:
-            elapsed = self.duration_s - (deadline - time.monotonic())
+            elapsed = duration_s - (deadline - time.monotonic())
             # Print a progress indicator every 5 seconds
             progress_tick = int(elapsed) // 5 * 5
             if progress_tick != last_progress and int(elapsed) > 0:
@@ -191,9 +237,9 @@ class PPK2AmpMeter:
         """Stop current sampling and disable DUT power output."""
         if self.ppk2 is not None:
             try:
-                self.ppk2.stop_measuring()
+                self.stop_sampling()
             finally:
-                self.ppk2.toggle_DUT_power("OFF")
+                self.disable_dut_power()
 
     # ------------------------------------------------------------------
     # Statistics
@@ -226,75 +272,211 @@ class PPK2AmpMeter:
     # ------------------------------------------------------------------
 
     def _ensure_csv_header(self) -> None:
-        """Write the CSV header row if the file does not already exist."""
+        """Ensure CSV uses the current schema and migrate legacy files if needed."""
+        expected_header = [
+            "timestamp",
+            "test_number",
+            "mode",
+            "avg_current_uA",
+            "min_current_uA",
+            "max_current_uA",
+            "sample_count",
+        ]
+        legacy_header = [
+            "timestamp",
+            "test_number",
+            "avg_current_uA",
+            "min_current_uA",
+            "max_current_uA",
+            "sample_count",
+        ]
+
         try:
             with open(self.csv_file, "x", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(
-                    ["timestamp", "test_number", "avg_current_uA",
-                     "min_current_uA", "max_current_uA", "sample_count"]
-                )
+                writer.writerow(expected_header)
+            return
         except FileExistsError:
             pass
 
-    def write_result_to_csv(self, stats: dict, timestamp: str) -> None:
+        with open(self.csv_file, "r", newline="") as f:
+            rows = list(csv.reader(f))
+
+        if not rows:
+            with open(self.csv_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(expected_header)
+            return
+
+        current_header = rows[0]
+        data_rows = rows[1:]
+
+        if current_header == expected_header:
+            return
+
+        migrated_rows: list[list[str]] = []
+
+        # Migrate known legacy schema and also normalize mixed 6/7-column rows.
+        if current_header == legacy_header:
+            for row in data_rows:
+                if not row:
+                    continue
+                if len(row) == 6:
+                    migrated_rows.append([row[0], row[1], "Legacy", row[2], row[3], row[4], row[5]])
+                elif len(row) >= 7:
+                    migrated_rows.append(row[:7])
+            with open(self.csv_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(expected_header)
+                writer.writerows(migrated_rows)
+            print(f"Migrated '{self.csv_file}' to include 'mode' column.")
+            return
+
+        # Fallback: if header is unexpected but rows are 6/7 wide, normalize them.
+        for row in data_rows:
+            if not row:
+                continue
+            if len(row) == 6:
+                migrated_rows.append([row[0], row[1], "Legacy", row[2], row[3], row[4], row[5]])
+            elif len(row) >= 7:
+                migrated_rows.append(row[:7])
+
+        if migrated_rows:
+            with open(self.csv_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(expected_header)
+                writer.writerows(migrated_rows)
+            print(f"Normalized '{self.csv_file}' to expected schema.")
+
+    def write_result_to_csv(self, stats: dict, timestamp: str, mode: str) -> None:
         """Append one result row to the CSV file.
 
         Args:
             stats:     dict returned by :meth:`compute_statistics`.
             timestamp: ISO-format timestamp string for this measurement.
+            mode:      Mode label (e.g., "BLE Advertisement" or "Sleep").
         """
         with open(self.csv_file, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
                 timestamp,
                 self.test_number,
+                mode,
                 f"{stats['avg_uA']:.4f}",
                 f"{stats['min_uA']:.4f}",
                 f"{stats['max_uA']:.4f}",
                 stats["sample_count"],
             ])
 
+    @staticmethod
+    def evaluate_pass_fail(ble_stats: dict, sleep_stats: dict) -> tuple[bool, str]:
+        """Evaluate pass/fail based on power consumption thresholds.
+
+        Args:
+            ble_stats:   Statistics dict for BLE Advertisement mode.
+            sleep_stats: Statistics dict for Sleep mode.
+
+        Returns:
+            (passed: bool, reason: str)
+        """
+        ble_avg = ble_stats["avg_uA"]
+        sleep_avg = sleep_stats["avg_uA"]
+
+        ble_pass = BLE_ADVERTISEMENT_MIN_UA <= ble_avg <= BLE_ADVERTISEMENT_MAX_UA
+        sleep_pass = SLEEP_MODE_MIN_UA <= sleep_avg <= SLEEP_MODE_MAX_UA
+
+        if ble_pass and sleep_pass:
+            return True, "PASS"
+
+        reasons = []
+        if not ble_pass:
+            reasons.append(
+                f"BLE Advertisement {ble_avg:.2f} µA out of range "
+                f"[{BLE_ADVERTISEMENT_MIN_UA}, {BLE_ADVERTISEMENT_MAX_UA}]"
+            )
+        if not sleep_pass:
+            reasons.append(
+                f"Sleep {sleep_avg:.2f} µA out of range "
+                f"[{SLEEP_MODE_MIN_UA}, {SLEEP_MODE_MAX_UA}]"
+            )
+
+        return False, "FAIL: " + "; ".join(reasons)
+
     # ------------------------------------------------------------------
-    # Single measurement cycle (high-level)
+    # Dual-phase measurement cycle (BLE Advertisement + Sleep)
     # ------------------------------------------------------------------
 
     def run_measurement_cycle(self) -> None:
-        """Execute one complete 30-second measurement cycle and log the result."""
+        """Execute a dual-phase measurement cycle:
+        1. Measure BLE advertising mode for 20 seconds.
+        2. Wait 10 seconds for DUT transition to sleep (DUT power remains ON).
+        3. Measure sleep mode for 20 seconds using a fresh sampling window.
+        Both results are logged to CSV. Pass/fail verdict is printed and logged.
+        """
         self.test_number += 1
         timestamp = datetime.now().isoformat(timespec="seconds")
 
-        print(f"\n[Test #{self.test_number}] Starting measurement at {timestamp}")
+        print(f"\n[Test #{self.test_number}] Starting dual-phase measurement at {timestamp}")
 
-        self.start_measurement()
+        self.enable_dut_power()
         try:
-            samples = self.collect_samples()
+            # --- Phase 1: BLE Advertisement Mode (20 seconds) ---
+            print("\n[Phase 1] Measuring BLE Advertisement mode …")
+            self.start_sampling()
+            try:
+                ble_samples = self.collect_samples(BLE_ADVERTISEMENT_DURATION_S)
+            finally:
+                self.stop_sampling()
+            ble_stats = self.compute_statistics(ble_samples)
+
+            print("\nBLE Advertisement mode complete")
+            print(f"Average current: {ble_stats['avg_uA']:.2f} µA")
+            print(f"Minimum current: {ble_stats['min_uA']:.2f} µA")
+            print(f"Maximum current: {ble_stats['max_uA']:.2f} µA")
+            print(f"Samples:         {ble_stats['sample_count']}")
+
+            self.write_result_to_csv(ble_stats, timestamp, "BLE Advertisement")
+
+            # --- Transition Wait (DUT power remains ON) ---
+            print(f"\n[Transition] Waiting {TRANSITION_WAIT_S} seconds for DUT to transition to sleep …")
+            print("(DUT power remains ON during transition)")
+            time.sleep(TRANSITION_WAIT_S)
+
+            # --- Phase 2: Sleep Mode ---
+            print("\n[Phase 2] Measuring Sleep mode with a fresh 20-second sampling window …")
+            self.start_sampling()
+            try:
+                sleep_samples = self.collect_samples(SLEEP_MODE_DURATION_S)
+            finally:
+                self.stop_sampling()
+            sleep_stats = self.compute_statistics(sleep_samples)
+
+            print("\nSleep mode measurement complete")
+            print(f"Average current: {sleep_stats['avg_uA']:.2f} µA")
+            print(f"Minimum current: {sleep_stats['min_uA']:.2f} µA")
+            print(f"Maximum current: {sleep_stats['max_uA']:.2f} µA")
+            print(f"Samples:         {sleep_stats['sample_count']}")
+
+            self.write_result_to_csv(sleep_stats, timestamp, "Sleep")
+
+            # --- Evaluate Pass/Fail ---
+            passed, verdict = self.evaluate_pass_fail(ble_stats, sleep_stats)
+            print(f"\n[Result] Power consumption test: {verdict}")
+
         finally:
-            # Always stop the PPK2 even if an exception is raised mid-flight
-            self.stop_measurement()
+            self.disable_dut_power()
 
-        stats = self.compute_statistics(samples)
-
-        # --- Console output ---
-        print("\nMeasurement complete")
-        print(f"Average current: {stats['avg_uA']:.2f} µA")
-        print(f"Minimum current: {stats['min_uA']:.2f} µA")
-        print(f"Maximum current: {stats['max_uA']:.2f} µA")
-        print(f"Samples:         {stats['sample_count']}")
-
-        # --- CSV logging ---
-        self.write_result_to_csv(stats, timestamp)
-        print(f"Result saved to '{self.csv_file}'.")
+        print(f"All results saved to '{self.csv_file}'.")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     meter = PPK2AmpMeter(
         port=SERIAL_PORT,
-        duration_s=MEASUREMENT_DURATION_S,
         csv_file=CSV_FILE,
     )
 
@@ -306,7 +488,11 @@ def main() -> None:
         return
 
     print("\nPPK2 ready.")
-    print(f"Press ENTER to power the DUT at {SOURCE_VOLTAGE_MV} mV and start a measurement, or Ctrl+C to quit.\n")
+    print(f"Press ENTER to power the DUT at {SOURCE_VOLTAGE_MV} mV and start a dual-phase measurement:")
+    print(f"  • Phase 1: {BLE_ADVERTISEMENT_DURATION_S}s BLE Advertisement mode")
+    print(f"  • Wait: {TRANSITION_WAIT_S}s for DUT transition to sleep")
+    print(f"  • Phase 2: {SLEEP_MODE_DURATION_S}s Sleep mode")
+    print(f"Press Ctrl+C to quit.\n")
 
     try:
         while True:
